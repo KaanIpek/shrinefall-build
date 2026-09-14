@@ -1,0 +1,427 @@
+# ===============================================================================================
+# CANONICAL COPY. THIS FILE RUNS IN A DIFFERENT REPOSITORY.
+#
+# It is edited here, in KaanIpek/shrinefall (PRIVATE), and DEPLOYED to KaanIpek/shrinefall-build
+# (PUBLIC) by Tools/ci_repo_bootstrap.sh. Editing it here changes nothing on its own - re-run that
+# script (or its `--workflow-only` mode) to push the change to the repo that actually runs it.
+# Nothing in this file may reference the source repository: the runner has no access to it and the
+# build repo is world-readable.
+#
+# WHY THE SPLIT. GitHub gives macOS runners away free on PUBLIC repositories only; on a private repo
+# one 24-minute macOS archive bills ~240 of the 2000 free monthly minutes (10x multiplier), i.e. the
+# whole allowance in one build. The game source must nevertheless stay private. So this workflow
+# lives alone in a public repo, fed an ENCRYPTED payload (Tools/push_ios_payload.sh) that it decrypts
+# with the PAYLOAD_KEY secret. The public repo therefore holds AES-256-CBC ciphertext and this file,
+# and neither is worth stealing. The same split already ships two other games from this machine.
+# ===============================================================================================
+#
+# Shrinefall -> TestFlight, from a Windows machine with no Mac.
+#
+# NO UNITY RUNS HERE. Unity 6 Personal cannot be activated in CI any more (no Unity_lic.ulf, manual
+# activation discontinued), so:
+#
+#   Unity -> Xcode project      on the DEV MACHINE, where the licence is already active
+#   archive + sign + upload     here, on macos-latest, which is the only place xcodebuild exists
+#
+# ---- HOW TO RUN ------------------------------------------------------------------------------
+# 1. On the dev machine, in the PRIVATE source repo:
+#      Tools/build_ios.sh <N>           # Unity -buildTarget iOS ... IOSBuild.IOS -buildNumber N
+#      Tools/push_ios_payload.sh        # tars Builds/iOS, ENCRYPTS it, chunks it, force-pushes
+#                                       # the xcode-payload branch to THIS repo
+# 2. Run this workflow:
+#      gh workflow run ios-testflight.yml --repo KaanIpek/shrinefall-build \
+#         -f payload_branch=xcode-payload -f release_notes="Shrinefall build <N>"
+#      gh run watch --repo KaanIpek/shrinefall-build
+#
+# ---- WHAT THIS PIPELINE DELIBERATELY LACKS ---------------------------------------------------
+# No AdMob (no CocoaPods, no GADApplicationIdentifier, no vendored ad framework), no Play Games, no
+# Sign in with Apple (no entitlements file). The archive is the plain Unity-iPhone.xcodeproj unless a
+# Podfile shows up in the payload, in which case pod install runs and the workspace is built.
+#
+# ---- SECRETS (5, set on KaanIpek/shrinefall-build by Tools/ci_repo_bootstrap.sh) -------------
+#   PAYLOAD_KEY      the passphrase Tools/push_ios_payload.sh encrypted the tarball with. Must be
+#                    BYTE-IDENTICAL to %USERPROFILE%/.shrinefall/ci.env on the dev machine; a
+#                    trailing newline or a Windows CR is a different key and shows up only as
+#                    openssl "bad decrypt".
+#   ASC_KEY_ID       App Store Connect API key id
+#   ASC_ISSUER_ID    App Store Connect issuer id
+#   ASC_KEY_P8_B64   base64 of the .p8 key. IT MUST HAVE THE **ADMIN** ROLE - App Manager can read
+#                    /v1/certificates but cannot CREATE the distribution certificate, and that
+#                    only fails several minutes into -exportArchive.
+#   APPLE_TEAM_ID    10-character team id
+#
+# GitHub secrets cannot be read back, so they are set from local files by the bootstrap script,
+# which never prints a value. Every run log here is world-readable - no step echoes a secret and
+# the payload arrives encrypted.
+
+name: ios-testflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_branch:
+        description: 'Branch holding ci-payload/xcode.part* (leave blank to use a Release asset)'
+        required: false
+        default: 'xcode-payload'
+      xcode_release_tag:
+        description: 'Release tag holding xcode-project.tar.gz.enc (used only when payload_branch is blank)'
+        required: false
+        default: 'xcode-1'
+      release_notes:
+        description: 'What testers see in TestFlight'
+        required: false
+        default: 'Shrinefall build'
+      allow_dev_packages:
+        description: 'Tolerate MCPForUnity (the editor bridge runtime) in the payload. Set false for a STORE build.'
+        required: false
+        default: 'true'
+
+jobs:
+  archive:
+    name: Archive, sign, upload to TestFlight
+    runs-on: macos-latest
+    permissions:
+      contents: read          # gh release download needs this and nothing more
+    steps:
+      # NO actions/checkout. Nothing in this job reads a file from this repository's main branch -
+      # the Xcode project arrives on the payload branch (or as a Release asset) and everything else
+      # happens under $RUNNER_TEMP. BOTH WAYS CARRY CIPHERTEXT: there is no plaintext path into this
+      # repository. The md5 recorded beside the parts is of the CIPHERTEXT and is checked before any
+      # key is involved, so a truncated chunk is reported as a truncated chunk, not as "bad decrypt".
+      - name: Fetch the encrypted payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ENC="$RUNNER_TEMP/xcode-project.tar.gz.enc"
+          if [ -n "${{ inputs.payload_branch }}" ]; then
+            git clone --depth 1 --branch "${{ inputs.payload_branch }}" --single-branch \
+              "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "$RUNNER_TEMP/payload"
+            ls -l "$RUNNER_TEMP/payload/ci-payload"
+            cat "$RUNNER_TEMP/payload/ci-payload/xcode.enc.spec" 2>/dev/null || \
+              echo "::warning::no xcode.enc.spec beside the parts"
+            cat "$RUNNER_TEMP/payload"/ci-payload/xcode.part* > "$ENC"
+            want=$(cat "$RUNNER_TEMP/payload/ci-payload/xcode.md5")
+            got=$(md5 -q "$ENC")
+            echo "ciphertext md5 want=$want got=$got"
+            [ "$want" = "$got" ] || { echo "::error::reassembled payload md5 mismatch - a chunk is truncated or missing"; exit 1; }
+          else
+            gh release download "${{ inputs.xcode_release_tag }}" \
+              --repo "$GITHUB_REPOSITORY" --pattern 'xcode-project.tar.gz.enc' --dir "$RUNNER_TEMP"
+          fi
+          ls -lh "$ENC"
+
+      # THE PAYLOAD IS ENCRYPTED BECAUSE THIS REPOSITORY IS PUBLIC. openssl selection is not
+      # paranoia: macOS ships LibreSSL as /usr/bin/openssl, which has differed across versions in what
+      # `enc` accepts; the runners also ship a real OpenSSL 3 from Homebrew. Prefer that, fall back,
+      # refuse to guess - a KDF mismatch decrypts to garbage that only fails later, in tar.
+      - name: Decrypt and unpack
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+        run: |
+          set -e
+          if [ -z "$PAYLOAD_KEY" ]; then
+            echo "::error::the PAYLOAD_KEY secret is not set on this repository. Tools/push_ios_payload.sh encrypted the payload; without the same passphrase this job cannot read its own input. Set it with Tools/ci_repo_bootstrap.sh --secrets-only"
+            exit 1
+          fi
+          OPENSSL=""
+          for cand in /opt/homebrew/opt/openssl@3/bin/openssl \
+                      /usr/local/opt/openssl@3/bin/openssl \
+                      /usr/bin/openssl; do
+            [ -x "$cand" ] || continue
+            if "$cand" enc -help 2>&1 | grep -q -- '-pbkdf2'; then OPENSSL="$cand"; break; fi
+          done
+          [ -n "$OPENSSL" ] || { echo "::error::no openssl on this runner supports -pbkdf2"; exit 1; }
+          echo "using $OPENSSL -> $("$OPENSSL" version)"
+
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 \
+            -in "$RUNNER_TEMP/xcode-project.tar.gz.enc" \
+            -out "$RUNNER_TEMP/xcode-project.tar.gz" \
+            -pass env:PAYLOAD_KEY \
+            || { echo "::error::decryption failed. The PAYLOAD_KEY secret here differs from %USERPROFILE%/.shrinefall/ci.env on the dev machine (a trailing newline or a Windows CR is enough)."; exit 1; }
+          ls -lh "$RUNNER_TEMP/xcode-project.tar.gz"
+          rm -f "$RUNNER_TEMP/xcode-project.tar.gz.enc"
+
+          mkdir -p "$RUNNER_TEMP/ios"
+          tar -xzf "$RUNNER_TEMP/xcode-project.tar.gz" -C "$RUNNER_TEMP/ios"
+          ls "$RUNNER_TEMP/ios/iOS" | head -40
+
+      # tar was used rather than actions/upload-artifact precisely because artifacts DO NOT PRESERVE
+      # THE EXECUTABLE BIT: Unity's output contains process_symbols.sh and friends, which then fail
+      # deep in a build phase with a bare "Permission denied" that names no file.
+      - name: Make Unity's helper scripts executable
+        run: |
+          find "$RUNNER_TEMP/ios/iOS" -name '*.sh' -exec chmod +x {} \;
+          ls -l "$RUNNER_TEMP"/ios/iOS/*.sh 2>/dev/null || true
+
+      # WHAT THE SOURCE PLIST AND MANIFEST SAY, BEFORE ANY MINUTE IS SPENT ARCHIVING. Every one of
+      # these was written by ShrinefallIOSPostProcess on the dev machine; a payload from a build where
+      # it did not run is named here, in the first minute, not at upload.
+      - name: Check the source Info.plist, privacy manifest and assemblies
+        run: |
+          set -e
+          SRC="$RUNNER_TEMP/ios/iOS"
+          PLIST="$SRC/Info.plist"
+          echo "--- $PLIST ---"
+          for key in CFBundleIdentifier CFBundleVersion CFBundleShortVersionString CFBundleIconName \
+                     ITSAppUsesNonExemptEncryption MinimumOSVersion; do
+            printf '%-34s ' "$key"
+            /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" 2>/dev/null || echo "(MISSING)"
+          done
+          echo "--- orientations ---"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$PLIST" 2>/dev/null || echo "(MISSING)"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$PLIST" 2>/dev/null || echo "(MISSING ~ipad)"
+          echo "--- URL types ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "$PLIST" 2>/dev/null || echo "(MISSING)"
+          fail=0
+          /usr/libexec/PlistBuddy -c "Print :ITSAppUsesNonExemptEncryption" "$PLIST" 2>/dev/null | grep -q false \
+            || { echo "::error::ITSAppUsesNonExemptEncryption is not false in the source plist - ShrinefallIOSPostProcess did not run"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" >/dev/null 2>&1 \
+            || { echo "::error::CFBundleIconName missing from the source plist"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "$PLIST" 2>/dev/null | grep -q shrinefall \
+            || { echo "::error::no shrinefall:// URL scheme in the source plist"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$PLIST" 2>/dev/null | grep -q Portrait \
+            && { echo "::error::a Portrait orientation is in the source plist - the game is landscape only"; fail=1; }
+          grep -q "UIInterfaceOrientationLandscapeLeft" "$PLIST" && grep -q "UIInterfaceOrientationLandscapeRight" "$PLIST" \
+            || { echo "::error::the two landscape orientations are not both in the source plist"; fail=1; }
+
+          echo "--- privacy manifests ---"
+          found=0
+          for m in "$SRC/UnityFramework/PrivacyInfo.xcprivacy" "$SRC/PrivacyInfo.xcprivacy"; do
+            [ -f "$m" ] || continue
+            found=1
+            echo "== $m"
+            /usr/libexec/PlistBuddy -c "Print :NSPrivacyCollectedDataTypes" "$m" | grep NSPrivacyCollectedDataType || true
+            for untrue in EmailAddress OtherUserContactInfo CustomerSupport CoarseLocation; do
+              grep -q "NSPrivacyCollectedDataType$untrue" "$m" \
+                && { echo "::error::$m still declares $untrue - the audit in ShrinefallIOSPostProcess did not run"; fail=1; }
+            done
+            grep -q "NSPrivacyCollectedDataTypeUserID" "$m" \
+              || { echo "::error::$m does not declare UserID (the anonymous UGS PlayerId)"; fail=1; }
+          done
+          [ "$found" = "1" ] || echo "::warning::no PrivacyInfo.xcprivacy in the payload"
+
+          echo "--- scripting assemblies ---"
+          SA="$SRC/Data/ScriptingAssemblies.json"
+          if [ -f "$SA" ] && grep -q MCPForUnity "$SA"; then
+            if [ "${{ inputs.allow_dev_packages }}" = "true" ]; then
+              echo "::warning::MCPForUnity (the editor bridge runtime) is in this build - fine for TestFlight, remove com.coplaydev.unity-mcp from Packages/manifest.json before the store build"
+            else
+              echo "::error::MCPForUnity is in ScriptingAssemblies.json and allow_dev_packages=false - remove com.coplaydev.unity-mcp from Packages/manifest.json and rebuild"; fail=1
+            fi
+          else
+            echo "no MCPForUnity in the build"
+          fi
+          [ "$fail" = "0" ] || exit 1
+
+      # The runner ships several Xcodes and its default is not always the newest. Apple checks the
+      # SDK AT UPLOAD - archive and export both succeed, then App Store Connect returns a 409 about
+      # the SDK. Print it so the log answers "what was this built with".
+      - name: Select the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          NEWEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "selecting $NEWEST"
+          sudo xcode-select -s "$NEWEST/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      # `secrets` is NOT a valid context inside `if:` - writing `if: secrets.X != ''` does not
+      # evaluate false, it makes the YAML invalid and the run reports zero jobs with no error.
+      - name: Do we have signing secrets?
+        id: keys
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_B64 }}
+        run: |
+          if [ -n "$P8" ]; then echo "signed=true" >> "$GITHUB_OUTPUT"
+          else echo "signed=false" >> "$GITHUB_OUTPUT"; fi
+
+      # Shrinefall has no CocoaPods dependency today (no ads SDK). If a Podfile ever appears in the
+      # payload (EDM4U, a future SDK), install it and build the workspace; otherwise the project.
+      - name: pod install (only if a Podfile exists)
+        id: pods
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: |
+          if [ -f Podfile ]; then
+            cat Podfile
+            pod install || { echo "plain pod install failed; retrying with --repo-update"; pod install --repo-update; }
+            ls -d Unity-iPhone.xcworkspace
+            echo "container=-workspace Unity-iPhone.xcworkspace" >> "$GITHUB_OUTPUT"
+          else
+            echo "no Podfile - building Unity-iPhone.xcodeproj directly"
+            echo "container=-project Unity-iPhone.xcodeproj" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage the App Store Connect key
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          mkdir -p ~/private_keys
+          echo "${{ secrets.ASC_KEY_P8_B64 }}" | base64 --decode > ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          chmod 600 ~/private_keys/*.p8
+
+      # Unity emits a SHARED scheme, so -scheme resolves. Listed anyway because a missing scheme
+      # fails with text that offers nothing to act on.
+      - name: List schemes
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: xcodebuild -list ${{ steps.pods.outputs.container }}
+
+      # ARCHIVE UNSIGNED, SIGN AT EXPORT. Archiving WITH signing cannot work for this account:
+      # `archive` with automatic signing builds with a DEVELOPMENT identity, and development
+      # profiles are generated from registered devices. With no Mac and no device there is nothing
+      # to register, so the archive is unsigned and all real signing happens at export, which asks
+      # only for a distribution profile (-allowProvisioningUpdates + the ASC key mints it).
+      - name: Archive (unsigned)
+        working-directory: ${{ runner.temp }}/ios/iOS
+        run: |
+          xcodebuild \
+            ${{ steps.pods.outputs.container }} \
+            -scheme Unity-iPhone \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Shrinefall.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      # Every upload-stage rejection is visible in the archive in two seconds. ITMS errors otherwise
+      # arrive by EMAIL ten minutes later. CFBundleIconName is declared in the source plist by the
+      # post-process; because a declared key could hide actool never having run at all, the COMPILED
+      # catalog (Assets.car) is asserted separately - key and icons are two different failures.
+      - name: Check the built Info.plist
+        run: |
+          APP=$(ls -d "$RUNNER_TEMP"/Shrinefall.xcarchive/Products/Applications/*.app | head -1)
+          PLIST="$APP/Info.plist"
+          echo "reading $PLIST"
+          for key in CFBundleIdentifier CFBundleVersion CFBundleShortVersionString CFBundleIconName \
+                     ITSAppUsesNonExemptEncryption MinimumOSVersion DTSDKName; do
+            printf '%-34s ' "$key"
+            /usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" 2>/dev/null || echo "(MISSING)"
+          done
+          echo "--- icon payload in the bundle ---"
+          ls -l "$APP"/Assets.car 2>/dev/null || echo "Assets.car ABSENT"
+
+          fail=0
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" 2>/dev/null | grep -qx "com.rldgames.shrinefall" \
+            || { echo "::error::CFBundleIdentifier is not com.rldgames.shrinefall"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$PLIST" >/dev/null 2>&1 \
+            || { echo "::error::CFBundleIconName missing - the app icon did not reach the build"; fail=1; }
+          test -f "$APP/Assets.car" \
+            || { echo "::error::Assets.car absent - actool did not compile Images.xcassets, so the icon the plist names does not exist in the bundle"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :ITSAppUsesNonExemptEncryption" "$PLIST" 2>/dev/null | grep -q false \
+            || { echo "::error::ITSAppUsesNonExemptEncryption is not false in the built app - every TestFlight build would sit at Missing Compliance"; fail=1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "$PLIST" 2>/dev/null | grep -q shrinefall \
+            || { echo "::error::the shrinefall:// URL scheme did not survive into the built app"; fail=1; }
+          echo "--- privacy manifest in the built framework ---"
+          FWM="$APP/Frameworks/UnityFramework.framework/PrivacyInfo.xcprivacy"
+          if [ -f "$FWM" ]; then
+            /usr/libexec/PlistBuddy -c "Print :NSPrivacyCollectedDataTypes" "$FWM" | grep NSPrivacyCollectedDataType || true
+            for untrue in EmailAddress OtherUserContactInfo CustomerSupport CoarseLocation; do
+              grep -q "NSPrivacyCollectedDataType$untrue" "$FWM" && { echo "::error::built UnityFramework manifest still declares $untrue"; fail=1; }
+            done
+          else
+            echo "(no PrivacyInfo.xcprivacy inside UnityFramework.framework)"
+          fi
+          [ "$fail" = "0" ] || exit 1
+
+      # exportArchive re-signs nested code that already carries a signature and skips code that
+      # arrived bare (90035 at upload). Everything Xcode compiles is signed before it is embedded, so
+      # with no vendored binary frameworks this loop should find nothing bare - it stays because a
+      # future SDK drop would otherwise fail at Apple's server, minutes after export said "success".
+      # Ad-hoc signing needs no identity; it exists so export has a signature to REPLACE.
+      - name: Ad-hoc sign any bare framework so export will re-sign it
+        working-directory: ${{ runner.temp }}
+        run: |
+          APP=$(ls -d Shrinefall.xcarchive/Products/Applications/*.app | head -1)
+          echo "app: $APP"
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            name=$(basename "$fw")
+            if codesign -v "$fw" >/dev/null 2>&1; then
+              printf '%-52s already signed\n' "$name"
+            else
+              printf '%-52s bare -> ad-hoc signing\n' "$name"
+              codesign --force --sign - "$fw"
+            fi
+          done
+          # The app bundle's own signature seals its nested code, so it is (re)done last.
+          codesign --force --sign - "$APP" 2>/dev/null || true
+          echo "--- state going into export ---"
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            printf '%-52s ' "$(basename "$fw")"
+            codesign -v "$fw" >/dev/null 2>&1 && echo signed || echo STILL-BARE
+          done
+
+      - name: Export a signed .ipa
+        if: steps.keys.outputs.signed == 'true'
+        working-directory: ${{ runner.temp }}
+        run: |
+          # method must be app-store-connect on Xcode 15.3+. NEVER set testFlightInternalTestingOnly:
+          # such a build is permanently barred from external TestFlight and the App Store, with no
+          # promote-later path. teamID is required or a multi-team account fails to resolve.
+          cat > ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>destination</key><string>export</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Shrinefall.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8 \
+            -authenticationKeyID ${{ secrets.ASC_KEY_ID }} \
+            -authenticationKeyIssuerID ${{ secrets.ASC_ISSUER_ID }}
+          ls -l "$RUNNER_TEMP/export"
+
+      # The same verdict Apple gives at upload (90035 for a bare nested bundle) is available locally
+      # in seconds: --deep walks every nested bundle, --strict refuses a merely tolerated signature.
+      - name: Verify every nested signature before uploading
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          cd "$RUNNER_TEMP" && rm -rf sigcheck && mkdir sigcheck
+          unzip -q export/*.ipa -d sigcheck
+          APP=$(ls -d sigcheck/Payload/*.app | head -1)
+          echo "--- embedded frameworks ---"
+          ls "$APP/Frameworks" 2>/dev/null || echo "(none)"
+          fail=0
+          for fw in "$APP"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            printf '%-52s ' "$(basename "$fw")"
+            codesign -v --strict "$fw" 2>&1 && echo "OK" || { echo "UNSIGNED/INVALID"; fail=1; }
+          done
+          echo "--- whole app, deep ---"
+          codesign -vvv --deep --strict "$APP" 2>&1 || fail=1
+          echo "--- signing identity actually used ---"
+          codesign -dvv "$APP" 2>&1 | grep -iE "Authority|TeamIdentifier" || true
+          [ "$fail" = "0" ] \
+            || { echo "::error::A nested bundle is unsigned or invalidly signed - Apple rejects this with 90035, see the per-framework list above"; exit 1; }
+
+      - name: Upload to TestFlight
+        if: steps.keys.outputs.signed == 'true'
+        run: |
+          # altool's NOTARIZATION was removed in 2023 - that is what "altool is deprecated" refers to.
+          # --upload-app for App Store submissions still works and reads the key from ~/private_keys.
+          xcrun altool --upload-app -f "$RUNNER_TEMP"/export/*.ipa -t ios \
+            --apiKey "${{ secrets.ASC_KEY_ID }}" \
+            --apiIssuer "${{ secrets.ASC_ISSUER_ID }}"
+          echo "Uploaded. Processing takes a few minutes. Release notes: ${{ inputs.release_notes }}"
+          echo "REMINDER: a build assigned to NO tester group is valid and completely invisible -"
+          echo "testers keep being offered the previous build, with no error anywhere."
+          echo "REMINDER: the App Store Connect app record for com.rldgames.shrinefall must exist"
+          echo "BEFORE this upload, or altool fails with 'No suitable application records were found'."
+
+      - name: Keep the archive when signing is not configured
+        if: steps.keys.outputs.signed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-xcarchive
+          path: ${{ runner.temp }}/Shrinefall.xcarchive
+          retention-days: 3
